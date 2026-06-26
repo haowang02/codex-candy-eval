@@ -216,18 +216,22 @@ def main() -> None:
     # 串行执行：逐个请求，完成一个立即打印该行结果。
     rows = []
     graded = []
-    # 支持 ANSI 时保存表格起始位置，后续回到这里原地重绘；否则结束后一次性打印。
-    if use_ansi:
-        print("\033[s", end="", flush=True)
+    prev_lines = 0  # 上一次绘制的表格占据的屏幕行数，用于原地重绘时上移光标
     for index in range(1, args.tests + 1):
         row, ok = run_one(index)
         rows.append(row)
         if ok is not None:
             graded.append(ok)
         if use_ansi:
-            # 恢复到表格起始位置，清除旧表格，再绘制累计结果。
-            print("\033[u\033[J", end="")
-            print(render_table(headers, rows, aligns), flush=True)
+            # 用“行数计数 + 光标上移（CSI A）”替代 save/restore（CSI s/u）。
+            # macOS Terminal.app 不支持 CSI s/u，会导致表格每轮向下堆叠、表头重复；
+            # 光标上移序列所有常见终端都支持，最稳妥。
+            if prev_lines > 0:
+                sys.stdout.write(f"\033[{prev_lines}A\033[J")
+            table = render_table(headers, rows, aligns)
+            sys.stdout.write(table + "\n")
+            sys.stdout.flush()
+            prev_lines = table.count("\n") + 1
     if not use_ansi:
         print(render_table(headers, rows, aligns), flush=True)
 
