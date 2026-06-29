@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用本地 codex 跑 5 个问题测量 codex 的 TPS（tokens per second）。
+"""用 Krill 的 OpenAI-compatible 接口跑 5 个问题，测量输出 TPS。
 
     python codex_tps_eval.py -m gpt-5.5 -r high
 """
@@ -9,11 +9,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
-import subprocess
 import sys
 import time
 import unicodedata
+
+try:
+    from openai import OpenAI
+except ImportError as exc:  # ponytail: 直接报依赖缺失，避免再猜 HTTP 细节
+    raise SystemExit("缺少 openai 包，请先运行: pip install openai") from exc
+
+AUTH_FILE = os.path.expanduser(r"~/.codex/auth.json")
+API_BASE_URL = "https://api.krill-ai.com/codex/v1"
 
 # 统一的前缀：明确禁止读写文件 / 调用工具，要求把完整解答直接写进回答里。
 PROMPT_PREFIX = (
@@ -46,63 +52,43 @@ QUESTIONS = [
 ]
 
 
+def _load_api_key() -> str:
+    try:
+        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+            auth = json.load(f)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"找不到鉴权文件：{AUTH_FILE}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"鉴权文件不是合法 JSON：{AUTH_FILE}") from exc
+
+    api_key = auth.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(f"鉴权文件缺少 OPENAI_API_KEY：{AUTH_FILE}")
+    return api_key
+
+
+def _make_client() -> OpenAI:
+    return OpenAI(base_url=API_BASE_URL, api_key=_load_api_key())
+
+
+def _extract_reasoning_tokens(usage) -> int | None:
+    details = getattr(usage, "completion_tokens_details", None) or getattr(usage, "output_tokens_details", None)
+    return getattr(details, "reasoning_tokens", None)
+
+
 def run_codex(prompt: str, model: str | None, effort: str):
-    # Windows 上 codex 多是 npm 安装的 codex.cmd 包装脚本，裸名字 CreateProcess 找
-    # 不到（PATH 搜索只补 .exe），用 shutil.which 解析出带扩展名的完整路径再执行。
-    exe = shutil.which("codex")
-    if not exe:
-        raise RuntimeError("找不到 codex 可执行文件，请确认已安装并加入 PATH。")
-
-    cmd = [
-        exe, "exec", "--json",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "-s", "read-only",
-        # 关闭 codex 的跨会话记忆（~/.codex/memories），避免历史记忆注入提示词、污染
-        # 评测结果，保证不同机器/不同记忆状态下结果可复现。等价于 -c features.memories=false。
-        "--disable", "memories",
-        "-c", f"model_reasoning_effort={effort}",
-    ]
-    if model:
-        cmd += ["-m", model]
-
-    # 多行题目通过 stdin 传入：作为命令行参数时，经 cmd.exe/codex.cmd 包装后换行会被
-    # 吞掉，而管道里的内容能完整保留。codex exec 在无位置参数且 stdin 非 TTY 时读 stdin。
-    proc = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    client = _make_client()
+    completion = client.chat.completions.create(
+        model=model or "gpt-5.5",
+        messages=[{"role": "user", "content": prompt}],
+        reasoning_effort=effort,
     )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
-
-    # codex --json emits one JSON event per line. The final answer is the last
-    # `agent_message` item; token usage (incl. reasoning) is in `turn.completed`.
-    final_text = ""
-    usage: dict = {}
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "item.completed":
-            item = event.get("item", {})
-            if item.get("type") == "agent_message":
-                final_text = item.get("text", final_text)
-        elif event.get("type") == "turn.completed":
-            usage = event.get("usage") or {}
-
+    usage = completion.usage
     return (
-        final_text,
-        usage.get("input_tokens"),
-        usage.get("output_tokens"),
-        usage.get("reasoning_output_tokens"),
+        completion.choices[0].message.content or "",
+        getattr(usage, "prompt_tokens", None),
+        getattr(usage, "completion_tokens", None),
+        _extract_reasoning_tokens(usage),
     )
 
 
@@ -187,12 +173,7 @@ def _enable_windows_ansi() -> bool:
 
 
 def setup_console() -> bool:
-    """统一输出为 UTF-8（避免中文在 GBK 等控制台编码下抛 UnicodeEncodeError），
-    并探测是否可用 ANSI 光标控制做表格原地刷新。
-
-    返回 True 表示可原地重绘；否则（如输出被重定向、或旧版 Windows 无法开 VT）退化为
-    结束后一次性打印整张表，避免屏幕上出现 `←[s` 之类的转义乱码。
-    """
+    """统一输出为 UTF-8，并探测是否可用 ANSI 光标控制做表格原地刷新。"""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -208,7 +189,7 @@ def setup_console() -> bool:
 def main() -> None:
     use_ansi = setup_console()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-m", "--model", help="Codex model name; omit for the local default.")
+    parser.add_argument("-m", "--model", help="Model name; omit for gpt-5.5.")
     parser.add_argument(
         "-r", "--reasoning-effort", default="medium",
         choices=["low", "medium", "high", "xhigh"],
@@ -231,21 +212,16 @@ def main() -> None:
         except Exception as exc:
             return [index, q_preview, f"ERROR: {preview(str(exc))}", *["-"] * 5], None
 
-    # 逐个串行执行：完成一个立即打印该行结果。
-    tasks = list(QUESTIONS)
-
     rows = []
     tps_values = []
-    # 支持 ANSI 时保存表格起始位置，后续回到这里原地重绘；否则结束后一次性打印。
     if use_ansi:
         print("\033[s", end="", flush=True)
-    for index, question in enumerate(tasks, start=1):
+    for index, question in enumerate(QUESTIONS, start=1):
         row, tps = run_one(index, question)
         rows.append(row)
         if tps is not None:
             tps_values.append(tps)
         if use_ansi:
-            # 恢复到表格起始位置，清除旧表格，再绘制累计结果。
             print("\033[u\033[J", end="")
             print(render_table(headers, rows, aligns), flush=True)
     if not use_ansi:
@@ -253,10 +229,9 @@ def main() -> None:
 
     if tps_values:
         avg = sum(tps_values) / len(tps_values)
-        print(f"\nMeasured {len(tps_values)}/{len(tasks)} runs  "
-              f"avg TPS = {avg:.1f} tok/s")
+        print(f"\nMeasured {len(tps_values)}/{len(QUESTIONS)} runs  avg TPS = {avg:.1f} tok/s")
     else:
-        print(f"\nMeasured 0/{len(tasks)} runs")
+        print(f"\nMeasured 0/{len(QUESTIONS)} runs")
 
 
 if __name__ == "__main__":

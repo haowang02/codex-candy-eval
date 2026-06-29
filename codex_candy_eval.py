@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用本地 codex CLI 测试糖果问题，统计 reasoning tokens 并判分。
+"""用 Krill 的 OpenAI-compatible 接口测试糖果问题，统计 reasoning tokens 并判分。
     python codex_candy_eval.py -m gpt-5.5 -r high -n 5
 """
 
@@ -9,11 +9,17 @@ import argparse
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 import unicodedata
+
+try:
+    from openai import OpenAI
+except ImportError as exc:  # ponytail: 直接报依赖缺失，避免再猜 HTTP 细节
+    raise SystemExit("缺少 openai 包，请先运行: pip install openai") from exc
+
+AUTH_FILE = os.path.expanduser(r"~/.codex/auth.json")
+API_BASE_URL = "https://api.krill-ai.com/codex/v1"
 
 CODEX_PROMPT = """不使用任何外部工具回答以下问题：
 
@@ -28,63 +34,43 @@ CODEX_PROMPT = """不使用任何外部工具回答以下问题：
 ANSWER_PATTERN = re.compile(r"(?<!\d)21(?!\d)")
 
 
+def _load_api_key() -> str:
+    try:
+        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+            auth = json.load(f)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"找不到鉴权文件：{AUTH_FILE}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"鉴权文件不是合法 JSON：{AUTH_FILE}") from exc
+
+    api_key = auth.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(f"鉴权文件缺少 OPENAI_API_KEY：{AUTH_FILE}")
+    return api_key
+
+
+def _make_client() -> OpenAI:
+    return OpenAI(base_url=API_BASE_URL, api_key=_load_api_key())
+
+
+def _extract_reasoning_tokens(usage) -> int | None:
+    details = getattr(usage, "completion_tokens_details", None) or getattr(usage, "output_tokens_details", None)
+    return getattr(details, "reasoning_tokens", None)
+
+
 def run_codex(model: str | None, effort: str):
-    # Windows 上 codex 多是 npm 安装的 codex.cmd 包装脚本，裸名字 CreateProcess 找
-    # 不到（PATH 搜索只补 .exe），用 shutil.which 解析出带扩展名的完整路径再执行。
-    exe = shutil.which("codex")
-    if not exe:
-        raise RuntimeError("找不到 codex 可执行文件，请确认已安装并加入 PATH。")
-
-    cmd = [
-        exe, "exec", "--json",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "-s", "read-only",
-        # 关闭 codex 的跨会话记忆（~/.codex/memories），避免历史记忆注入提示词、污染
-        # 评测结果，保证不同机器/不同记忆状态下结果可复现。等价于 -c features.memories=false。
-        "--disable", "memories",
-        "-c", f"model_reasoning_effort={effort}",
-    ]
-    if model:
-        cmd += ["-m", model]
-
-    # 多行题目通过 stdin 传入：作为命令行参数时，经 cmd.exe/codex.cmd 包装后换行会被
-    # 吞掉，而管道里的内容能完整保留。codex exec 在无位置参数且 stdin 非 TTY 时读 stdin。
-    proc = subprocess.run(
-        cmd,
-        input=CODEX_PROMPT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    client = _make_client()
+    completion = client.chat.completions.create(
+        model=model or "gpt-5.5",
+        messages=[{"role": "user", "content": CODEX_PROMPT}],
+        reasoning_effort=effort,
     )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
-
-    # codex --json emits one JSON event per line. The final answer is the last
-    # `agent_message` item; token usage (incl. reasoning) is in `turn.completed`.
-    final_text = ""
-    usage: dict = {}
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "item.completed":
-            item = event.get("item", {})
-            if item.get("type") == "agent_message":
-                final_text = item.get("text", final_text)
-        elif event.get("type") == "turn.completed":
-            usage = event.get("usage") or {}
-
+    usage = completion.usage
     return (
-        final_text,
-        usage.get("input_tokens"),
-        usage.get("output_tokens"),
-        usage.get("reasoning_output_tokens"),
+        completion.choices[0].message.content or "",
+        getattr(usage, "prompt_tokens", None),
+        getattr(usage, "completion_tokens", None),
+        _extract_reasoning_tokens(usage),
     )
 
 
@@ -169,12 +155,7 @@ def _enable_windows_ansi() -> bool:
 
 
 def setup_console() -> bool:
-    """统一输出为 UTF-8（避免 ✓/✗、中文在 GBK 等控制台编码下抛 UnicodeEncodeError），
-    并探测是否可用 ANSI 光标控制做表格原地刷新。
-
-    返回 True 表示可原地重绘；否则（如输出被重定向、或旧版 Windows 无法开 VT）退化为
-    结束后一次性打印整张表，避免屏幕上出现 `←[s` 之类的转义乱码。
-    """
+    """统一输出为 UTF-8，并探测是否可用 ANSI 光标控制做表格原地刷新。"""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -190,55 +171,42 @@ def setup_console() -> bool:
 def main() -> None:
     use_ansi = setup_console()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-m", "--model", help="Codex model name; omit for the local default.")
+    parser.add_argument("-m", "--model", help="Model name; omit for gpt-5.5.")
     parser.add_argument(
         "-r", "--reasoning-effort", default="medium",
         choices=["low", "medium", "high", "xhigh"],
     )
-    parser.add_argument("-n", "--tests", type=int, default=1)
+    parser.add_argument("-n", "--runs", type=int, default=5, help="Number of repeated runs")
     args = parser.parse_args()
 
-    headers = ["Run", "Codex", "In Tok", "Out Tok", "Reason Tok", "Time(s)", "TPS", "OK"]
-    aligns = ["right", "left", "right", "right", "right", "right", "right", "center"]
+    headers = ["Run", "Answer", "Correct", "In Tok", "Out Tok", "Reason Tok", "Time(s)"]
+    aligns = ["right", "left", "center", "right", "right", "right", "right"]
 
-    def run_one(index: int) -> tuple[list, bool | None]:
+    def run_one(i: int) -> tuple[list, bool]:
         try:
             start = time.perf_counter()
             text, in_tok, out_tok, rea_tok = run_codex(args.model, args.reasoning_effort)
             elapsed = time.perf_counter() - start
-            tps = out_tok / elapsed if out_tok and elapsed > 0 else None
             ok = bool(ANSWER_PATTERN.search(text))
-            return [index, preview(text), in_tok, out_tok, rea_tok, f"{elapsed:.1f}",
-                    f"{tps:.1f}" if tps else "-", "✓" if ok else "✗"], ok
+            return [i, preview(text), "✓" if ok else "✗", in_tok, out_tok, rea_tok, f"{elapsed:.1f}"], ok
         except Exception as exc:
-            return [index, f"ERROR: {preview(str(exc))}", *["-"] * 6], None
+            return [i, f"ERROR: {preview(str(exc))}", "-", "-", "-", "-", "-"], False
 
-    # 串行执行：逐个请求，完成一个立即打印该行结果。
     rows = []
-    graded = []
-    prev_lines = 0  # 上一次绘制的表格占据的屏幕行数，用于原地重绘时上移光标
-    for index in range(1, args.tests + 1):
-        row, ok = run_one(index)
+    correct = 0
+    if use_ansi:
+        print("\033[s", end="", flush=True)
+    for i in range(1, args.runs + 1):
+        row, ok = run_one(i)
         rows.append(row)
-        if ok is not None:
-            graded.append(ok)
+        correct += int(ok)
         if use_ansi:
-            # 用“行数计数 + 光标上移（CSI A）”替代 save/restore（CSI s/u）。
-            # macOS Terminal.app 不支持 CSI s/u，会导致表格每轮向下堆叠、表头重复；
-            # 光标上移序列所有常见终端都支持，最稳妥。
-            if prev_lines > 0:
-                sys.stdout.write(f"\033[{prev_lines}A\033[J")
-            table = render_table(headers, rows, aligns)
-            sys.stdout.write(table + "\n")
-            sys.stdout.flush()
-            prev_lines = table.count("\n") + 1
+            print("\033[u\033[J", end="")
+            print(render_table(headers, rows, aligns), flush=True)
     if not use_ansi:
         print(render_table(headers, rows, aligns), flush=True)
 
-    correct = sum(graded)
-    print(f"\nGraded {len(graded)}/{args.tests}  correct={correct}  "
-          f"accuracy={correct / len(graded) * 100:.1f}%"
-          if graded else f"\nGraded 0/{args.tests}")
+    print(f"\nScore: {correct}/{args.runs}")
 
 
 if __name__ == "__main__":
