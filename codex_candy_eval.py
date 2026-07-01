@@ -28,12 +28,27 @@ CODEX_PROMPT = """不使用任何外部工具回答以下问题：
 ANSWER_PATTERN = re.compile(r"(?<!\d)21(?!\d)")
 
 
+def resolve_codex_executable() -> str:
+    """找到可被 subprocess 直接启动的 codex 命令。
+
+    Windows/npm 安装通常会同时生成 `codex`、`codex.cmd` 和 `codex.ps1`。
+    `shutil.which("codex")` 可能先命中无扩展名 shim，CreateProcess 无法直接运行，
+    会报 WinError 193；因此 Windows 上优先选择 `.cmd`。
+    """
+    candidates = (
+        ("codex.cmd", "codex.exe", "codex")
+        if os.name == "nt"
+        else ("codex",)
+    )
+    for name in candidates:
+        exe = shutil.which(name)
+        if exe:
+            return exe
+    raise RuntimeError("找不到 codex 可执行文件，请确认已安装并加入 PATH。")
+
+
 def run_codex(model: str | None, effort: str):
-    # Windows 上 codex 多是 npm 安装的 codex.cmd 包装脚本，裸名字 CreateProcess 找
-    # 不到（PATH 搜索只补 .exe），用 shutil.which 解析出带扩展名的完整路径再执行。
-    exe = shutil.which("codex")
-    if not exe:
-        raise RuntimeError("找不到 codex 可执行文件，请确认已安装并加入 PATH。")
+    exe = resolve_codex_executable()
 
     cmd = [
         exe, "exec", "--json",
