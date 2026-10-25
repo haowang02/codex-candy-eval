@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""用本地 codex CLI 测试糖果问题，统计 reasoning tokens 并判分。
-    python codex_candy_eval.py -m gpt-5.5 -r high -n 5
+"""用本地 codex CLI 测试糖果问题
+    python codex_candy_eval.py -m gpt-6.1-sol -r low -n 5
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 import unicodedata
+from datetime import datetime
+from pathlib import Path
 
 CODEX_PROMPT = """不使用任何外部工具回答以下问题：
 
@@ -26,6 +27,25 @@ CODEX_PROMPT = """不使用任何外部工具回答以下问题：
 
 # 正确答案为 21：只要回答中出现独立的 "21"（前后非数字）即判为正确。
 ANSWER_PATTERN = re.compile(r"(?<!\d)21(?!\d)")
+
+# (表头, 宽度, 是否右对齐)；Codex 列宽度为 None，由 column_widths() 按终端宽度决定。
+COLUMNS = [
+    ("Run", 3, True), ("Codex", None, False), ("In Tok", 6, True), ("Out Tok", 7, True),
+    ("Reason Tok", 10, True), ("Time(s)", 7, True), ("TPS", 6, True), ("OK", 2, False),
+]
+GAP = "  "
+CODEX_MIN, CODEX_MAX = 24, 40
+
+# 依次去掉：代码围栏、标题和引用、列表标记、链接和图片、加粗和删除线、斜体、行内代码。
+MARKDOWN_PATTERNS = [
+    (r"```[^\n]*\n?", ""),
+    (r"(?m)^\s{0,3}(?:#{1,6}|>)\s*", ""),
+    (r"(?m)^\s*(?:[-*+]|\d+[.)])\s+", ""),
+    (r"!?\[([^\]]*)\]\([^)]*\)", r"\1"),
+    (r"(\*\*|__|~~)(.+?)\1", r"\2"),
+    (r"(?<![\w*])\*([^*\s][^*]*)\*(?![\w*])", r"\1"),
+    (r"`+([^`]*)`+", r"\1"),
+]
 
 
 def resolve_codex_executable() -> str:
@@ -53,12 +73,12 @@ def run_codex(model: str | None, effort: str):
     cmd = [
         exe, "exec", "--json",
         "--skip-git-repo-check",
-        "--ephemeral",
         "-s", "read-only",
         # 关闭 codex 的跨会话记忆（~/.codex/memories），避免历史记忆注入提示词、污染
         # 评测结果，保证不同机器/不同记忆状态下结果可复现。等价于 -c features.memories=false。
         "--disable", "memories",
         "-c", f"model_reasoning_effort={effort}",
+        "-c", "notify=[]",
     ]
     if model:
         cmd += ["-m", model]
@@ -79,6 +99,7 @@ def run_codex(model: str | None, effort: str):
     # codex --json emits one JSON event per line. The final answer is the last
     # `agent_message` item; token usage (incl. reasoning) is in `turn.completed`.
     final_text = ""
+    thread_id = None
     usage: dict = {}
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -88,19 +109,35 @@ def run_codex(model: str | None, effort: str):
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") == "item.completed":
+        if event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+        elif event.get("type") == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "agent_message":
                 final_text = item.get("text", final_text)
         elif event.get("type") == "turn.completed":
             usage = event.get("usage") or {}
 
-    return (
-        final_text,
-        usage.get("input_tokens"),
-        usage.get("output_tokens"),
-        usage.get("reasoning_output_tokens"),
-    )
+    return final_text, usage, thread_id
+
+
+def request_seconds(thread_id: str | None) -> float | None:
+    """模型请求耗时：session 里 turn_context（发请求前写入）到最后一条 token_usage_record。
+
+    不含 codex 启动等开销；找不到 session 或没有这两个事件时返回 None。
+    """
+    if not thread_id:
+        return None
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    stamps = {"turn_context": [], "token_usage_record": []}
+    for path in (home / "sessions").glob(f"**/rollout-*-{thread_id}.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event["type"] in stamps:
+                stamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
+                stamps[event["type"]].append(stamp.timestamp())
+    start, end = stamps["turn_context"], stamps["token_usage_record"]
+    return end[-1] - start[0] if start and end else None
 
 
 def char_width(char: str) -> int:
@@ -114,97 +151,54 @@ def display_width(text: str) -> int:
     return sum(char_width(c) for c in text)
 
 
-def pad(text: str, width: int, align: str) -> str:
+def pad(text: str, width: int, right: bool) -> str:
     """按显示宽度补空格对齐（中文宽字符按 2 计）。"""
-    gap = width - display_width(text)
-    if gap <= 0:
-        return text
-    if align == "right":
-        return " " * gap + text
-    if align == "center":
-        left = gap // 2
-        return " " * left + text + " " * (gap - left)
-    return text + " " * gap
+    fill = " " * (width - display_width(text))
+    return fill + text if right else text + fill
 
 
-def render_table(headers: list[str], rows: list[list], aligns: list[str]) -> str:
-    """原生渲染对齐表格（tabulate "simple" 风格），列宽按显示宽度计算。"""
-    str_rows = [[str(c) for c in row] for row in rows]
-    widths = [
-        max(display_width(headers[i]), *(display_width(r[i]) for r in str_rows)) if str_rows
-        else display_width(headers[i])
-        for i in range(len(headers))
-    ]
+def column_widths() -> list[int]:
+    """各列宽度，0 表示不显示。
 
-    def fmt(cells: list[str]) -> str:
-        return "  ".join(pad(cells[i], widths[i], aligns[i]) for i in range(len(headers)))
-
-    lines = [fmt(headers), "  ".join("-" * w for w in widths)]
-    lines += [fmt(r) for r in str_rows]
-    return "\n".join(lines)
-
-
-def preview(text: str, limit: int = 40) -> str:
-    flat = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", r"\n")
-    if display_width(flat) <= limit:
-        return flat
-
-    result = []
-    width = 0
-    for char in flat:
-        next_width = char_width(char)
-        if width + next_width > limit - 3:
-            break
-        result.append(char)
-        width += next_width
-    return "".join(result) + "..."
-
-
-def _enable_windows_ansi() -> bool:
-    """开启 Windows 控制台的 VT 处理，让 ANSI 转义序列（含光标定位）生效。"""
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        kernel32.GetStdHandle.restype = ctypes.c_void_p
-        kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-        kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-
-        STD_OUTPUT_HANDLE = -11
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        mode = ctypes.c_uint32()
-        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            return False
-        return bool(
-            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-        )
-    except Exception:
-        return False
-
-
-def setup_console() -> bool:
-    """统一输出为 UTF-8（避免 ✓/✗、中文在 GBK 等控制台编码下抛 UnicodeEncodeError），
-    并探测是否可用 ANSI 光标控制做表格原地刷新。
-
-    返回 True 表示可原地重绘；否则（如输出被重定向、或旧版 Windows 无法开 VT）退化为
-    结束后一次性打印整张表，避免屏幕上出现 `←[s` 之类的转义乱码。
+    Codex 列占用终端剩余宽度（至多 CODEX_MAX），不足 CODEX_MIN 时隐藏，避免整行折行。
+    留 1 列余量：部分终端写满最后一列会提前换行。输出被重定向时不限宽。
     """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-    if not sys.stdout.isatty():
-        return False
-    if os.name == "nt":
-        return _enable_windows_ansi()
-    return True
+    fixed = sum(w for _, w, _ in COLUMNS if w) + len(GAP) * (len(COLUMNS) - 1)
+    codex = CODEX_MAX
+    if sys.stdout.isatty():
+        codex = min(CODEX_MAX, shutil.get_terminal_size().columns - 1 - fixed)
+    return [w or (codex if codex >= CODEX_MIN else 0) for _, w, _ in COLUMNS]
+
+
+def format_row(cells: list, widths: list[int]) -> str:
+    return GAP.join(
+        pad(str(cell), width, right)
+        for cell, width, (_, _, right) in zip(cells, widths, COLUMNS)
+        if width
+    ).rstrip()
+
+
+def preview(text: str, limit: int) -> str:
+    """去掉 markdown 语法并折叠空白，按显示宽度截断。"""
+    for pattern, repl in MARKDOWN_PATTERNS:
+        text = re.sub(pattern, repl, text)
+    text = " ".join(text.split())
+    if display_width(text) <= limit:
+        return text
+
+    kept, width = "", 0
+    for char in text:
+        width += char_width(char)
+        if width > limit - 3:
+            break
+        kept += char
+    return kept.rstrip() + "..."
 
 
 def main() -> None:
-    use_ansi = setup_console()
-    parser = argparse.ArgumentParser(description=__doc__)
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-m", "--model", help="Codex model name; omit for the local default.")
     parser.add_argument(
         "-r", "--reasoning-effort", default="medium",
@@ -213,42 +207,38 @@ def main() -> None:
     parser.add_argument("-n", "--tests", type=int, default=1)
     args = parser.parse_args()
 
-    headers = ["Run", "Codex", "In Tok", "Out Tok", "Reason Tok", "Time(s)", "TPS", "OK"]
-    aligns = ["right", "left", "right", "right", "right", "right", "right", "center"]
+    widths = column_widths()
+    errors = []
 
     def run_one(index: int) -> tuple[list, bool | None]:
         try:
-            start = time.perf_counter()
-            text, in_tok, out_tok, rea_tok = run_codex(args.model, args.reasoning_effort)
-            elapsed = time.perf_counter() - start
-            tps = out_tok / elapsed if out_tok and elapsed > 0 else None
+            text, usage, thread_id = run_codex(args.model, args.reasoning_effort)
+            seconds = request_seconds(thread_id)
+            out_tok = usage.get("output_tokens")
+            tps = out_tok / seconds if out_tok and seconds else None
             ok = bool(ANSWER_PATTERN.search(text))
-            return [index, preview(text), in_tok, out_tok, rea_tok, f"{elapsed:.1f}",
+            return [index, preview(text, widths[1]), usage.get("input_tokens"), out_tok,
+                    usage.get("reasoning_output_tokens"), f"{seconds:.1f}" if seconds else "-",
                     f"{tps:.1f}" if tps else "-", "✓" if ok else "✗"], ok
         except Exception as exc:
-            return [index, f"ERROR: {preview(str(exc))}", *["-"] * 6], None
+            errors.append(f"Run {index}: {' '.join(str(exc).split())}")
+            return [index, "ERROR", *["-"] * 6], None
 
-    # 串行执行：逐个请求，完成一个立即打印该行结果。
-    rows = []
+    print(format_row([name for name, _, _ in COLUMNS], widths))
+    print(GAP.join("-" * w for w in widths if w))
+
+    # 串行执行，完成一个立即打印一行；终端里先显示占位行，完成后用 \r 回到行首覆盖。
+    tty = sys.stdout.isatty()
     graded = []
-    prev_lines = 0  # 上一次绘制的表格占据的屏幕行数，用于原地重绘时上移光标
     for index in range(1, args.tests + 1):
+        if tty:
+            print(f"{index:>{widths[0]}}{GAP}running...", end="", flush=True)
         row, ok = run_one(index)
-        rows.append(row)
         if ok is not None:
             graded.append(ok)
-        if use_ansi:
-            # 用“行数计数 + 光标上移（CSI A）”替代 save/restore（CSI s/u）。
-            # macOS Terminal.app 不支持 CSI s/u，会导致表格每轮向下堆叠、表头重复；
-            # 光标上移序列所有常见终端都支持，最稳妥。
-            if prev_lines > 0:
-                sys.stdout.write(f"\033[{prev_lines}A\033[J")
-            table = render_table(headers, rows, aligns)
-            sys.stdout.write(table + "\n")
-            sys.stdout.flush()
-            prev_lines = table.count("\n") + 1
-    if not use_ansi:
-        print(render_table(headers, rows, aligns), flush=True)
+        print(("\r" if tty else "") + format_row(row, widths), flush=True)
+    for error in errors:
+        print(error)
 
     correct = sum(graded)
     print(f"\nGraded {len(graded)}/{args.tests}  correct={correct}  "

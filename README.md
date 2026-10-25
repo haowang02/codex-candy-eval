@@ -6,25 +6,28 @@
 
 ## 用法
 
-该脚本无任何第三方依赖，只需要您已安装并登录 [Codex CLI](https://github.com/openai/codex)
+该脚本需要使用 [Codex CLI](https://github.com/openai/codex)
 
 ```bash
-python codex_candy_eval.py -m gpt-5.5 -r high -n 5
+python3 codex_candy_eval.py -m gpt-6.1-sol -r low -n 3
 ```
+
 ### 一键运行
+
 以下任选其一
+
 ```bash
-wget -qO- "https://raw.githubusercontent.com/haowang02/codex-candy-eval/main/codex_candy_eval.py" | python3 - -m gpt-5.5 -r high -n 5
-```
-```bash
-curl -fsSL "https://raw.githubusercontent.com/haowang02/codex-candy-eval/main/codex_candy_eval.py" | python3 - -m gpt-5.5 -r high -n 5
+wget -qO- https://is.gd/codex_candy | python3 - -m gpt-6.1-sol -r low -n 3
 ```
 
+```bash
+curl -fsSL https://is.gd/codex_candy | python3 - -m gpt-6.1-sol -r low -n 3
+```
 
 参数：
 
 - `-m, --model`：codex 模型名，省略则用本地默认
-- `-r, --reasoning-effort`：`low/medium/high/xhigh`（默认 `medium`）
+- `-r, --reasoning-effort`：`low/medium/high/xhigh/max/ultra`（默认 `medium`）
 - `-n, --tests`：测试次数（默认 1）
 
 正确答案为 **21**，脚本直接判断回答中是否出现独立的 `21`。
