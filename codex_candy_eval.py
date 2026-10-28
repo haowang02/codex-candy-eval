@@ -93,14 +93,14 @@ def run_codex(model: str | None, effort: str):
         encoding="utf-8",
         errors="replace",
     )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
-
     # codex --json emits one JSON event per line. The final answer is the last
     # `agent_message` item; token usage (incl. reasoning) is in `turn.completed`.
+    # 失败原因（如 "Selected model is at capacity"）在 stdout 的 error/turn.failed 事件里，
+    # stderr 只有 "Reading prompt from stdin..."，所以先解析事件再判断退出码。
     final_text = ""
     thread_id = None
     usage: dict = {}
+    error = ""
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -117,6 +117,13 @@ def run_codex(model: str | None, effort: str):
                 final_text = item.get("text", final_text)
         elif event.get("type") == "turn.completed":
             usage = event.get("usage") or {}
+        elif event.get("type") == "error":
+            error = event.get("message") or error
+        elif event.get("type") == "turn.failed":
+            error = (event.get("error") or {}).get("message") or error
+
+    if proc.returncode != 0:
+        raise RuntimeError(error or proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
 
     return final_text, usage, thread_id
 

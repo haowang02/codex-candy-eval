@@ -32,17 +32,21 @@ def ask(model: str, effort: str) -> str:
          "-c", f"model_reasoning_effort={effort}"],
         input=PROMPT, capture_output=True, text=True, encoding="utf-8",
     )
-    if proc.returncode:
-        raise RuntimeError(proc.stderr.strip() or "codex exec failed")
-    answer = ""
+    answer = error = ""
     for line in proc.stdout.splitlines():
         try:
             event = json.loads(line)
             item = event.get("item", {})
             if event.get("type") == "item.completed" and item.get("type") == "agent_message":
                 answer = item.get("text", answer)
+            elif event.get("type") == "error":  # 失败原因在 stdout 事件里，stderr 只有启动提示
+                error = event.get("message") or error
+            elif event.get("type") == "turn.failed":
+                error = (event.get("error") or {}).get("message") or error
         except json.JSONDecodeError:
             pass
+    if proc.returncode:
+        raise RuntimeError(error or proc.stderr.strip() or "codex exec failed")
     return answer
 
 
